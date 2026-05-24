@@ -1,17 +1,19 @@
-# pi-multi-pass
+# end-pi-multi-pass
 
-Multi-subscription extension for [pi](https://github.com/badlogic/pi-mono) -- use multiple OAuth accounts per provider with automatic rate-limit rotation and project-level affinity.
+Fork of [hjanuschka/pi-multi-pass](https://github.com/hjanuschka/pi-multi-pass), originally MIT licensed.
+
+Multi-subscription companion extension for [end-pi](https://github.com/neneee0181/end-pi) and [Pi](https://pi.dev) -- use multiple OAuth accounts per provider with automatic rate-limit rotation and project-level affinity.
 
 ## Install
 
 ```bash
-pi install npm:pi-multi-pass
+pi install npm:end-pi-multi-pass
 ```
 
 Or via git:
 
 ```bash
-pi install git:github.com/hjanuschka/pi-multi-pass
+pi install git:github.com/neneee0181/end-pi-multi-pass
 ```
 
 ## Features

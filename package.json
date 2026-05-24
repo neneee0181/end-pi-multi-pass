@@ -1,7 +1,7 @@
 {
-  "name": "pi-multi-pass",
-  "version": "1.3.0",
-  "description": "Multi-subscription extension for pi -- use multiple OAuth accounts per provider (Anthropic, Codex, Copilot, Gemini, Antigravity)",
+  "name": "end-pi-multi-pass",
+  "version": "0.0.1",
+  "description": "Multi-subscription companion extension for end-pi and Pi -- rotate OAuth accounts per provider with pools, presets, and failover",
   "keywords": [
     "pi-package",
     "pi-extension",
@@ -12,10 +12,10 @@
     "copilot"
   ],
   "license": "MIT",
-  "author": "hjanuschka",
+  "author": "neneee0181",
   "repository": {
     "type": "git",
-    "url": "https://github.com/hjanuschka/pi-multi-pass"
+    "url": "https://github.com/neneee0181/end-pi-multi-pass"
   },
   "pi": {
     "extensions": [
