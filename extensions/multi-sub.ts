@@ -94,6 +94,7 @@ import {
 
 type CopilotCredentials = OAuthCredentials & { enterpriseUrl?: string };
 type GeminiCredentials = OAuthCredentials & { projectId?: string };
+type ApiKeyCredentials = OAuthCredentials & { apiKey?: string };
 
 interface ProviderTemplate {
 	displayName: string;
@@ -123,6 +124,34 @@ function createAntigravityOAuthProvider(id: string, name: string): OAuthProvider
 		getApiKey(credentials: OAuthCredentials): string {
 			const creds = credentials as GeminiCredentials;
 			return JSON.stringify({ token: creds.access, projectId: creds.projectId });
+		},
+	};
+}
+
+function createApiKeyProvider(id: string, name: string, prompt: string): OAuthProviderInterface {
+	return {
+		id,
+		name,
+		async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
+			const key = await callbacks.onPrompt({
+				message: prompt,
+				placeholder: "API key",
+			});
+			const trimmed = key.trim();
+			if (!trimmed) throw new Error("API key is required");
+			return {
+				refresh: "",
+				access: trimmed,
+				apiKey: trimmed,
+				expires: 32_503_680_000_000,
+			};
+		},
+		async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
+			return credentials;
+		},
+		getApiKey(credentials: OAuthCredentials): string {
+			const creds = credentials as ApiKeyCredentials;
+			return creds.apiKey || creds.access;
 		},
 	};
 }
@@ -764,6 +793,18 @@ const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 					return JSON.stringify({ token: creds.access, projectId: creds.projectId });
 				},
 			};
+		},
+	},
+
+	"google": {
+		displayName: "Google Gemini API",
+		builtinOAuth: createApiKeyProvider("google", "Google Gemini API", "Enter your Google Gemini API key"),
+		buildOAuth(index: number) {
+			return createApiKeyProvider(
+				`google-${index}`,
+				`Google Gemini API #${index}`,
+				`Enter the API key for Google Gemini API #${index}`,
+			);
 		},
 	},
 

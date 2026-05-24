@@ -19,6 +19,7 @@ pi install git:github.com/neneee0181/end-pi-multi-pass
 ## Features
 
 - **Multiple subscriptions**: Add extra OAuth accounts for any provider
+- **API key providers**: Add extra Google Gemini API keys with `/subs add` and `/login`
 - **Updated Antigravity login**: Uses the newer Google Code Assist compatible OAuth flow and stores the discovered project ID
 - **Rotation pools**: Group subscriptions and auto-rotate on rate limits
 - **Smart pool strategies**: `round-robin`, `quota-first`, `scheduled` (time windows), `custom` (JS script hook)
@@ -355,6 +356,7 @@ Presets work with pools: if an entry's provider belongs to a pool, rate-limit fa
 | `anthropic` | Claude Pro/Max |
 | `openai-codex` | ChatGPT Plus/Pro (Codex) |
 | `github-copilot` | GitHub Copilot |
+| `google` | Google Gemini API key |
 | `google-gemini-cli` | Google Cloud Code Assist |
 | `google-antigravity` | Antigravity |
 
