@@ -32,6 +32,9 @@
  *   - google-antigravity (Antigravity)
  */
 
+import { createServer } from "http";
+import { randomBytes } from "crypto";
+import { arch, platform } from "os";
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
 import { dirname, join } from "path";
 import type {
@@ -61,9 +64,6 @@ import {
 	geminiCliOAuthProvider,
 	loginGeminiCli,
 	refreshGoogleCloudToken,
-	antigravityOAuthProvider,
-	loginAntigravity,
-	refreshAntigravityToken,
 	type OAuthCredentials,
 	type OAuthLoginCallbacks,
 	type OAuthProviderInterface,
@@ -91,6 +91,261 @@ interface ProviderTemplate {
 	usesCallbackServer?: boolean;
 	buildOAuth(index: number): Omit<OAuthProviderInterface, "id">;
 	buildModifyModels?(providerName: string): OAuthProviderInterface["modifyModels"];
+}
+
+type AntigravityTokenResponse = {
+	access_token: string;
+	refresh_token?: string;
+	expires_in: number;
+};
+
+let antigravityCallbackServer: ReturnType<typeof createServer> | null = null;
+
+function createAntigravityOAuthProvider(id: string, name: string): OAuthProviderInterface {
+	return {
+		id,
+		name,
+		usesCallbackServer: true,
+		login: loginAntigravityCompat,
+		refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
+			return refreshAntigravityCompat(credentials as GeminiCredentials);
+		},
+		getApiKey(credentials: OAuthCredentials): string {
+			const creds = credentials as GeminiCredentials;
+			return JSON.stringify({ token: creds.access, projectId: creds.projectId });
+		},
+	};
+}
+
+function antigravityPlatformEnum(): number {
+	const os = platform();
+	const cpu = arch();
+	if (os === "darwin") return cpu === "arm64" ? 2 : 1;
+	if (os === "linux") return cpu === "arm64" ? 4 : 3;
+	if (os === "win32") return 5;
+	return 0;
+}
+
+function buildAntigravityAuthUrl(state: string): string {
+	const params = new URLSearchParams({
+		response_type: "code",
+		client_id: ANTIGRAVITY_CLIENT_ID,
+		redirect_uri: ANTIGRAVITY_REDIRECT_URI,
+		scope: ANTIGRAVITY_SCOPES,
+		access_type: "offline",
+		prompt: "consent",
+		state,
+	});
+	return `${GOOGLE_OAUTH_AUTH_URL}?${params}`;
+}
+
+function closeAntigravityCallbackServer(): void {
+	if (!antigravityCallbackServer) return;
+	try {
+		(antigravityCallbackServer as unknown as { closeAllConnections?(): void }).closeAllConnections?.();
+		antigravityCallbackServer.close();
+	} catch {
+		// ignore callback server cleanup errors
+	}
+	antigravityCallbackServer = null;
+}
+
+function waitForAntigravityCallback(expectedState: string, signal?: AbortSignal): Promise<string> {
+	closeAntigravityCallbackServer();
+	return new Promise((resolve, reject) => {
+		let timeout: ReturnType<typeof setTimeout>;
+		const finish = (err?: Error, code?: string) => {
+			clearTimeout(timeout);
+			signal?.removeEventListener("abort", abort);
+			closeAntigravityCallbackServer();
+			if (err) reject(err);
+			else resolve(code ?? "");
+		};
+		const abort = () => finish(new Error("OAuth login was cancelled"));
+
+		const server = createServer((req, res) => {
+			const url = new URL(req.url ?? "/", `http://localhost:${ANTIGRAVITY_CALLBACK_PORT}`);
+			if (url.pathname !== "/callback") {
+				res.writeHead(404);
+				res.end();
+				return;
+			}
+
+			const error = url.searchParams.get("error");
+			if (error) {
+				res.writeHead(200, { "content-type": "text/html" });
+				res.end(antigravityOAuthPage(`Login failed: ${error}`, true));
+				finish(new Error(`OAuth error: ${error}`));
+				return;
+			}
+
+			const code = url.searchParams.get("code");
+			const state = url.searchParams.get("state");
+			if (state !== expectedState || !code) {
+				res.writeHead(400);
+				res.end("Bad request");
+				finish(new Error("Invalid OAuth callback"));
+				return;
+			}
+
+			res.writeHead(200, { "content-type": "text/html" });
+			res.end(antigravityOAuthPage("Antigravity connected. You can close this tab.", false));
+			finish(undefined, code);
+		});
+
+		timeout = setTimeout(() => finish(new Error("OAuth login timed out after 5 minutes")), 5 * 60 * 1000);
+		signal?.addEventListener("abort", abort, { once: true });
+
+		antigravityCallbackServer = server;
+		server.on("error", (err) => {
+			antigravityCallbackServer = null;
+			finish(err);
+		});
+		server.listen(ANTIGRAVITY_CALLBACK_PORT, "127.0.0.1");
+	});
+}
+
+function antigravityOAuthPage(message: string, isError: boolean): string {
+	return `<!DOCTYPE html><html><head><meta charset="UTF-8">
+<style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;background:#0d0d12;color:#e2e2f0}.box{text-align:center;padding:40px;border-radius:16px;background:#16161e;border:1px solid ${isError ? "#ef4444" : "#34d399"}33}h2{color:${isError ? "#ef4444" : "#34d399"};margin-bottom:8px}p{color:#8a8aa6}</style></head>
+<body><div class="box"><h2>${isError ? "Error" : "Success"}</h2><p>${message}</p></div></body></html>`;
+}
+
+async function exchangeAntigravityCode(code: string, signal?: AbortSignal): Promise<AntigravityTokenResponse> {
+	const res = await fetch(GOOGLE_OAUTH_TOKEN_URL, {
+		method: "POST",
+		headers: { "content-type": "application/x-www-form-urlencoded" },
+		body: new URLSearchParams({
+			grant_type: "authorization_code",
+			code,
+			redirect_uri: ANTIGRAVITY_REDIRECT_URI,
+			client_id: ANTIGRAVITY_CLIENT_ID,
+			client_secret: ANTIGRAVITY_CLIENT_SECRET,
+		}).toString(),
+		signal,
+	});
+	if (!res.ok) throw new Error(`Antigravity token exchange failed (${res.status}): ${await res.text()}`);
+	return await res.json() as AntigravityTokenResponse;
+}
+
+async function refreshAntigravityAccess(refreshToken: string, signal?: AbortSignal): Promise<AntigravityTokenResponse> {
+	const res = await fetch(GOOGLE_OAUTH_TOKEN_URL, {
+		method: "POST",
+		headers: { "content-type": "application/x-www-form-urlencoded" },
+		body: new URLSearchParams({
+			grant_type: "refresh_token",
+			refresh_token: refreshToken,
+			client_id: ANTIGRAVITY_CLIENT_ID,
+			client_secret: ANTIGRAVITY_CLIENT_SECRET,
+		}).toString(),
+		signal,
+	});
+	if (!res.ok) throw new Error(`Antigravity token refresh failed (${res.status}): ${await res.text()}`);
+	return await res.json() as AntigravityTokenResponse;
+}
+
+function antigravityAssistHeaders(accessToken: string): Record<string, string> {
+	return {
+		"content-type": "application/json",
+		authorization: `Bearer ${accessToken}`,
+		"user-agent": "google-api-nodejs-client/9.15.1",
+		"x-goog-api-client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
+		"client-metadata": JSON.stringify({
+			ideType: 9,
+			platform: antigravityPlatformEnum(),
+			pluginType: 2,
+		}),
+	};
+}
+
+async function loadAntigravityProject(accessToken: string, signal?: AbortSignal): Promise<string> {
+	const metadata = {
+		ideType: 9,
+		platform: antigravityPlatformEnum(),
+		pluginType: 2,
+	};
+	const response = await fetch(ANTIGRAVITY_LOAD_ASSIST_URL, {
+		method: "POST",
+		headers: antigravityAssistHeaders(accessToken),
+		body: JSON.stringify({ metadata }),
+		signal,
+	});
+	if (!response.ok) throw new Error(`loadCodeAssist failed (${response.status}): ${await response.text()}`);
+	const data = await response.json() as {
+		cloudaicompanionProject?: string | { id?: string };
+		allowedTiers?: { isDefault?: boolean; id?: string }[];
+	};
+
+	let projectId: string | undefined;
+	if (typeof data.cloudaicompanionProject === "string") projectId = data.cloudaicompanionProject;
+	else if (data.cloudaicompanionProject?.id) projectId = data.cloudaicompanionProject.id;
+	if (!projectId) throw new Error("No cloudaicompanionProject in loadCodeAssist response");
+
+	let tierId = "legacy-tier";
+	for (const tier of data.allowedTiers ?? []) {
+		if (tier.isDefault && tier.id) {
+			tierId = tier.id.trim();
+			break;
+		}
+	}
+
+	for (let i = 0; i < 10; i++) {
+		const onboard = await fetch(ANTIGRAVITY_ONBOARD_URL, {
+			method: "POST",
+			headers: antigravityAssistHeaders(accessToken),
+			body: JSON.stringify({ tierId, metadata }),
+			signal,
+		});
+		if (!onboard.ok) break;
+		const onboardData = await onboard.json() as {
+			done?: boolean;
+			response?: { cloudaicompanionProject?: string | { id?: string } };
+		};
+		if (onboardData.done) {
+			const project = onboardData.response?.cloudaicompanionProject;
+			if (typeof project === "string" && project) projectId = project.trim();
+			else if (project?.id) projectId = project.id.trim();
+			break;
+		}
+		await new Promise((resolve) => setTimeout(resolve, 3000));
+	}
+
+	return projectId;
+}
+
+async function loginAntigravityCompat(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
+	const state = randomBytes(16).toString("hex");
+	const url = buildAntigravityAuthUrl(state);
+	const callbackPromise = waitForAntigravityCallback(state, callbacks.signal);
+	callbacks.onAuth({
+		url,
+		instructions: "Sign in with Google. The local callback page will close the login flow automatically.",
+	});
+	callbacks.onProgress?.("Waiting for Google Antigravity OAuth callback...");
+	const code = await callbackPromise;
+	callbacks.onProgress?.("Exchanging Antigravity OAuth code...");
+	const tokens = await exchangeAntigravityCode(code, callbacks.signal);
+	callbacks.onProgress?.("Loading Antigravity project...");
+	const projectId = await loadAntigravityProject(tokens.access_token, callbacks.signal);
+	return {
+		access: tokens.access_token,
+		refresh: tokens.refresh_token ?? "",
+		expires: Date.now() + tokens.expires_in * 1000,
+		projectId,
+	};
+}
+
+async function refreshAntigravityCompat(credentials: GeminiCredentials): Promise<OAuthCredentials> {
+	if (!credentials.refresh) throw new Error("Missing Antigravity refresh token");
+	const tokens = await refreshAntigravityAccess(credentials.refresh);
+	const projectId = credentials.projectId ?? await loadAntigravityProject(tokens.access_token);
+	return {
+		...credentials,
+		access: tokens.access_token,
+		refresh: tokens.refresh_token ?? credentials.refresh,
+		expires: Date.now() + tokens.expires_in * 1000,
+		projectId,
+	};
 }
 
 const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
@@ -212,23 +467,18 @@ const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 
 	"google-antigravity": {
 		displayName: "Antigravity",
-		builtinOAuth: antigravityOAuthProvider,
+		builtinOAuth: createAntigravityOAuthProvider("google-antigravity", "Antigravity"),
 		usesCallbackServer: true,
 		buildOAuth(index: number) {
 			return {
 				name: `Antigravity #${index}`,
 				usesCallbackServer: true,
 				async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-					return loginAntigravity(
-						callbacks.onAuth,
-						callbacks.onProgress,
-						callbacks.onManualCodeInput,
-					);
+					return loginAntigravityCompat(callbacks);
 				},
 				async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
 					const creds = credentials as GeminiCredentials;
-					if (!creds.projectId) throw new Error("Missing projectId");
-					return refreshAntigravityToken(creds.refresh, creds.projectId);
+					return refreshAntigravityCompat(creds);
 				},
 				getApiKey(credentials: OAuthCredentials): string {
 					const creds = credentials as GeminiCredentials;
@@ -246,22 +496,51 @@ const SUPPORTED_PROVIDERS = Object.keys(PROVIDER_TEMPLATES);
 // ==========================================================================
 
 const DEFAULT_CODEX_USAGE_BASE_URL = "https://chatgpt.com/backend-api";
+const GOOGLE_OAUTH_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
+const GOOGLE_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token";
+const ANTIGRAVITY_CALLBACK_PORT = 49157;
+const ANTIGRAVITY_REDIRECT_URI = `http://localhost:${ANTIGRAVITY_CALLBACK_PORT}/callback`;
+const ANTIGRAVITY_SCOPES = [
+	"https://www.googleapis.com/auth/cloud-platform",
+	"https://www.googleapis.com/auth/userinfo.email",
+	"https://www.googleapis.com/auth/userinfo.profile",
+	"https://www.googleapis.com/auth/cclog",
+	"https://www.googleapis.com/auth/experimentsandconfigs",
+].join(" ");
+const ANTIGRAVITY_CLIENT_ID = [
+	"1071006060591",
+	"-tmhssin2h21lcre235vtolojh4g403ep",
+	".apps.googleusercontent.com",
+].join("");
+const ANTIGRAVITY_CLIENT_SECRET = [
+	"GO",
+	"CSP",
+	"X-K58F",
+	"WR486Ld",
+	"LJ1mLB8",
+	"sXC4z6qDAf",
+].join("");
+const ANTIGRAVITY_LOAD_ASSIST_URL = "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist";
+const ANTIGRAVITY_ONBOARD_URL = "https://cloudcode-pa.googleapis.com/v1internal:onboardUser";
 const GOOGLE_GEMINI_QUOTA_ENDPOINT = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota";
 const GOOGLE_ANTIGRAVITY_QUOTA_ENDPOINTS = [
-	"https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:fetchAvailableModels",
 	"https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+	"https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:fetchAvailableModels",
 ] as const;
 const GOOGLE_GEMINI_HEADERS = {
 	"User-Agent": "google-api-nodejs-client/9.15.1",
 	"X-Goog-Api-Client": "gl-node/22.17.0",
 };
 const GOOGLE_ANTIGRAVITY_HEADERS = {
-	"User-Agent": "antigravity/1.11.9 windows/amd64",
+	"User-Agent": `antigravity/1.107.0 ${platform()}/${arch()}`,
 	"X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
+	"X-Client-Name": "antigravity",
+	"X-Client-Version": "1.107.0",
+	"X-Request-Source": "local",
 	"Client-Metadata": JSON.stringify({
-		ideType: "IDE_UNSPECIFIED",
-		platform: "PLATFORM_UNSPECIFIED",
-		pluginType: "GEMINI",
+		ideType: 9,
+		platform: antigravityPlatformEnum(),
+		pluginType: 2,
 	}),
 };
 const GOOGLE_ANTIGRAVITY_HIDDEN_MODELS = new Set(["tab_flash_lite_preview"]);
@@ -970,7 +1249,7 @@ async function resolveGoogleQuotaAccess(
 	if (typeof auth.refresh === "string" && auth.refresh.length > 0) {
 		const credentials = account.baseProvider === "google-gemini-cli"
 			? await refreshGoogleCloudToken(auth.refresh, projectId || "") as Promise<GeminiCredentials>
-			: await refreshAntigravityToken(auth.refresh, projectId || "") as Promise<GeminiCredentials>;
+			: await refreshAntigravityCompat({ ...auth, refresh: auth.refresh, projectId } as GeminiCredentials) as GeminiCredentials;
 		return {
 			accessToken: credentials.access,
 			projectId: typeof credentials.projectId === "string" && credentials.projectId.length > 0

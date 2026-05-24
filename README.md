@@ -19,6 +19,7 @@ pi install git:github.com/neneee0181/end-pi-multi-pass
 ## Features
 
 - **Multiple subscriptions**: Add extra OAuth accounts for any provider
+- **Updated Antigravity login**: Uses the newer Google Code Assist compatible OAuth flow and stores the discovered project ID
 - **Rotation pools**: Group subscriptions and auto-rotate on rate limits
 - **Smart pool strategies**: `round-robin`, `quota-first`, `scheduled` (time windows), `custom` (JS script hook)
 - **Fallback chains**: Define ordered cross-pool/model failover via `/pool chain`
