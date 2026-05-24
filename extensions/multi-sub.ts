@@ -396,14 +396,35 @@ function piContentToAntigravityParts(content: unknown): unknown[] {
 	return parts.length ? parts : [{ text: "" }];
 }
 
-function contextToAntigravityContents(context: Context): unknown[] {
+function isValidAntigravityThoughtSignature(signature: unknown): signature is string {
+	if (typeof signature !== "string" || signature.length === 0) return false;
+	if (signature.length % 4 !== 0) return false;
+	return /^[A-Za-z0-9+/]+={0,2}$/.test(signature);
+}
+
+function contextToAntigravityContents(model: Model<Api>, context: Context): unknown[] {
 	return context.messages
 		.map((message) => {
 			if (message.role === "assistant") {
+				const keepSignature = message.provider === model.provider && message.model === model.id;
 				const parts = message.content.flatMap((part) => {
-					if (part.type === "text") return [{ text: part.text }];
+					if (part.type === "text") {
+						const thoughtSignature = keepSignature && isValidAntigravityThoughtSignature(part.textSignature)
+							? part.textSignature
+							: undefined;
+						return [{ text: part.text, ...(thoughtSignature && { thoughtSignature }) }];
+					}
 					if (part.type === "toolCall") {
-						return [{ functionCall: { name: part.name, args: part.arguments } }];
+						const thoughtSignature = keepSignature && isValidAntigravityThoughtSignature(part.thoughtSignature)
+							? part.thoughtSignature
+							: undefined;
+						return [{
+							functionCall: {
+								name: part.name,
+								args: part.arguments,
+							},
+							...(thoughtSignature && { thoughtSignature }),
+						}];
 					}
 					return [];
 				});
@@ -449,7 +470,7 @@ async function callAntigravityDirect(
 	signal?: AbortSignal,
 ): Promise<Response> {
 	const request: Record<string, unknown> = {
-		contents: contextToAntigravityContents(context),
+		contents: contextToAntigravityContents(model, context),
 		generationConfig: { maxOutputTokens: model.maxTokens || 8192 },
 		sessionId: randomUUID() + Date.now().toString(),
 	};
@@ -576,8 +597,15 @@ function streamAntigravityDirect(
 							if (typeof part.text === "string" && !part.thought) {
 								startText();
 								currentText += part.text;
-								const block = partial.content[currentTextIndex!] as { type: "text"; text: string };
+								const block = partial.content[currentTextIndex!] as {
+									type: "text";
+									text: string;
+									textSignature?: string;
+								};
 								block.text = currentText;
+								if (isValidAntigravityThoughtSignature(part.thoughtSignature)) {
+									block.textSignature = part.thoughtSignature;
+								}
 								stream.push({ type: "text_delta", contentIndex: currentTextIndex!, delta: part.text, partial });
 							}
 							if (part.functionCall) {
@@ -587,6 +615,9 @@ function streamAntigravityDirect(
 									id: part.functionCall.id || `${part.functionCall.name}_${Date.now()}_${++toolCallCounter}`,
 									name: part.functionCall.name || "",
 									arguments: part.functionCall.args ?? {},
+									...(isValidAntigravityThoughtSignature(part.thoughtSignature)
+										? { thoughtSignature: part.thoughtSignature }
+										: {}),
 								};
 								partial.content.push(toolCall);
 								const contentIndex = partial.content.length - 1;
