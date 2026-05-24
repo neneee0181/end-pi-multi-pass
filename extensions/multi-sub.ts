@@ -490,6 +490,15 @@ const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 };
 
 const SUPPORTED_PROVIDERS = Object.keys(PROVIDER_TEMPLATES);
+const ANTIGRAVITY_FALLBACK_MODELS = [
+	"gemini-3.5-flash",
+	"gemini-3.1-pro-high",
+	"gemini-3.1-pro-low",
+	"gemini-3-flash",
+	"claude-sonnet-4-6",
+	"claude-opus-4-6-thinking",
+	"gpt-oss-120b-medium",
+] as const;
 
 // ==========================================================================
 // Built-in quota checking
@@ -2155,6 +2164,18 @@ function getBaseProvider(providerName: string): string | undefined {
 
 function cloneModels(originalProvider: string, index: number) {
 	const models = getModels(originalProvider as any) as Model<Api>[];
+	if (models.length === 0 && originalProvider === "google-antigravity") {
+		return ANTIGRAVITY_FALLBACK_MODELS.map((id) => ({
+			id,
+			name: `${id} (#${index})`,
+			api: "openai-responses" as Api,
+			reasoning: /pro|opus|thinking/i.test(id),
+			input: ["text", "image"] as ("text" | "image")[],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 1_000_000,
+			maxTokens: 8192,
+		}));
+	}
 	return models.map((m) => ({
 		id: m.id,
 		name: `${m.name} (#${index})`,
@@ -2169,6 +2190,20 @@ function cloneModels(originalProvider: string, index: number) {
 	}));
 }
 
+function readCustomProviderBaseUrl(providerName: string): string | undefined {
+	try {
+		const modelsPath = join(getAgentDir(), "models.json");
+		if (!existsSync(modelsPath)) return undefined;
+		const raw = JSON.parse(readFileSync(modelsPath, "utf-8")) as {
+			providers?: Record<string, { baseUrl?: string }>;
+		};
+		const baseUrl = raw.providers?.[providerName]?.baseUrl;
+		return typeof baseUrl === "string" && baseUrl.length > 0 ? baseUrl : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 // ==========================================================================
 // Register a single subscription as a provider
 // ==========================================================================
@@ -2181,12 +2216,16 @@ function registerSub(pi: ExtensionAPI, entry: SubEntry): void {
 	const oauth = template.buildOAuth(entry.index);
 	const modifyModels = template.buildModifyModels?.(name);
 	const builtinModels = getModels(entry.provider as any) as Model<Api>[];
-	const baseUrl = builtinModels[0]?.baseUrl || "";
+	const baseUrl = builtinModels[0]?.baseUrl
+		|| readCustomProviderBaseUrl(entry.provider)
+		|| (entry.provider === "google-antigravity" ? "http://localhost:51200" : "");
+	const api = builtinModels[0]?.api
+		|| (entry.provider === "google-antigravity" ? "openai-responses" as Api : undefined);
 	const models = cloneModels(entry.provider, entry.index);
 
 	pi.registerProvider(name, {
 		baseUrl,
-		api: builtinModels[0]?.api,
+		api,
 		oauth: modifyModels ? { ...oauth, modifyModels } : oauth,
 		models,
 	});
