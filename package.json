@@ -1,6 +1,6 @@
 {
   "name": "end-pi-multi-pass",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "description": "Multi-subscription companion extension for end-pi and Pi -- rotate OAuth accounts per provider with pools, presets, and failover",
   "keywords": [
     "pi-package",

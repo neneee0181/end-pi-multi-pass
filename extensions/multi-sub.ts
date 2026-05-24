@@ -33,7 +33,7 @@
  */
 
 import { createServer } from "http";
-import { randomBytes } from "crypto";
+import { randomBytes, randomUUID } from "crypto";
 import { arch, platform } from "os";
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
 import { dirname, join } from "path";
@@ -68,7 +68,17 @@ import {
 	type OAuthLoginCallbacks,
 	type OAuthProviderInterface,
 } from "@mariozechner/pi-ai/oauth";
-import { getModels, type Api, type Model } from "@mariozechner/pi-ai";
+import {
+	createAssistantMessageEventStream,
+	getModels,
+	type Api,
+	type AssistantMessage,
+	type AssistantMessageEventStream,
+	type Context,
+	type Model,
+	type SimpleStreamOptions,
+	type ToolCall,
+} from "@mariozechner/pi-ai";
 import {
 	Container,
 	Key,
@@ -348,6 +358,267 @@ async function refreshAntigravityCompat(credentials: GeminiCredentials): Promise
 	};
 }
 
+function emptyUsage(): AssistantMessage["usage"] {
+	return {
+		input: 0,
+		output: 0,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: 0,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	};
+}
+
+function createPartialMessage(model: Model<Api>): AssistantMessage {
+	return {
+		role: "assistant",
+		content: [],
+		api: model.api,
+		provider: model.provider,
+		model: model.id,
+		usage: emptyUsage(),
+		stopReason: "stop",
+		timestamp: Date.now(),
+	};
+}
+
+function piContentToAntigravityParts(content: unknown): unknown[] {
+	if (typeof content === "string") return [{ text: content }];
+	if (!Array.isArray(content)) return [{ text: String(content ?? "") }];
+	const parts: unknown[] = [];
+	for (const part of content as { type?: string; text?: string; data?: string; mimeType?: string }[]) {
+		if (part.type === "text") {
+			parts.push({ text: String(part.text ?? "") });
+		} else if (part.type === "image" && part.data && part.mimeType) {
+			parts.push({ inlineData: { data: part.data, mimeType: part.mimeType } });
+		}
+	}
+	return parts.length ? parts : [{ text: "" }];
+}
+
+function contextToAntigravityContents(context: Context): unknown[] {
+	return context.messages
+		.map((message) => {
+			if (message.role === "assistant") {
+				const parts = message.content.flatMap((part) => {
+					if (part.type === "text") return [{ text: part.text }];
+					if (part.type === "toolCall") {
+						return [{ functionCall: { name: part.name, args: part.arguments } }];
+					}
+					return [];
+				});
+				return { role: "model", parts: parts.length ? parts : [{ text: "" }] };
+			}
+			if (message.role === "toolResult") {
+				const text = message.content
+					.filter((part) => part.type === "text")
+					.map((part) => part.text)
+					.join("");
+				return {
+					role: "user",
+					parts: [{
+						functionResponse: {
+							name: message.toolName,
+							response: {
+								content: text,
+								isError: message.isError,
+							},
+						},
+					}],
+				};
+			}
+			return { role: "user", parts: piContentToAntigravityParts(message.content) };
+		});
+}
+
+function toolsToAntigravityDeclarations(context: Context): unknown[] {
+	return (context.tools ?? []).map((tool) => ({
+		functionDeclarations: [{
+			name: tool.name,
+			description: tool.description,
+			parameters: tool.parameters,
+		}],
+	}));
+}
+
+async function callAntigravityDirect(
+	accessToken: string,
+	model: Model<Api>,
+	context: Context,
+	projectId?: string,
+	signal?: AbortSignal,
+): Promise<Response> {
+	const request: Record<string, unknown> = {
+		contents: contextToAntigravityContents(context),
+		generationConfig: { maxOutputTokens: model.maxTokens || 8192 },
+		sessionId: randomUUID() + Date.now().toString(),
+	};
+	if (context.systemPrompt) request.systemInstruction = { parts: [{ text: context.systemPrompt }] };
+	const tools = toolsToAntigravityDeclarations(context);
+	if (tools.length) {
+		request.tools = tools;
+		request.toolConfig = { functionCallingConfig: { mode: "VALIDATED" } };
+	}
+
+	const body = {
+		project: projectId || `end-pi-${randomUUID().slice(0, 8)}`,
+		model: model.id.replace(/^ag\//, ""),
+		userAgent: "antigravity",
+		requestType: "agent",
+		requestId: `agent-${randomUUID()}`,
+		request,
+	};
+
+	return fetch(`${ANTIGRAVITY_GENERATE_BASE_URL}/v1internal:streamGenerateContent?alt=sse`, {
+		method: "POST",
+		headers: {
+			"content-type": "application/json",
+			authorization: `Bearer ${accessToken}`,
+			"user-agent": `antigravity/1.107.0 ${platform()}/${arch()}`,
+			"x-request-source": "local",
+			accept: "text/event-stream",
+		},
+		body: JSON.stringify(body),
+		signal,
+	});
+}
+
+function pushAntigravityError(
+	stream: AssistantMessageEventStream,
+	model: Model<Api>,
+	error: unknown,
+	aborted = false,
+): void {
+	const message = createPartialMessage(model);
+	message.stopReason = aborted ? "aborted" : "error";
+	message.errorMessage = error instanceof Error ? error.message : String(error);
+	stream.push({ type: "error", reason: message.stopReason, error: message });
+	stream.end();
+}
+
+function streamAntigravityDirect(
+	model: Model<Api>,
+	context: Context,
+	options?: SimpleStreamOptions,
+): AssistantMessageEventStream {
+	const stream = createAssistantMessageEventStream();
+	const partial = createPartialMessage(model);
+	stream.push({ type: "start", partial });
+
+	(async () => {
+		try {
+			const rawApiKey = options?.apiKey;
+			if (!rawApiKey) throw new Error("Missing Antigravity OAuth credentials. Run /subs login.");
+			let accessToken = rawApiKey;
+			let projectId: string | undefined;
+			try {
+				const parsed = JSON.parse(rawApiKey) as { token?: string; projectId?: string };
+				accessToken = parsed.token || rawApiKey;
+				projectId = parsed.projectId;
+			} catch {
+				// Raw bearer tokens are also accepted.
+			}
+			if (!accessToken || accessToken === "proxy-managed") {
+				throw new Error("Invalid Antigravity OAuth token. Run /subs login again.");
+			}
+
+			const response = await callAntigravityDirect(accessToken, model, context, projectId, options?.signal);
+			if (!response.ok) throw new Error(`Antigravity error ${response.status}: ${await response.text()}`);
+			if (!response.body) throw new Error("Antigravity response had no body");
+
+			const reader = response.body.getReader();
+			const decoder = new TextDecoder();
+			let buffer = "";
+			let currentTextIndex: number | null = null;
+			let currentText = "";
+			let toolCallCounter = 0;
+			const startText = () => {
+				if (currentTextIndex !== null) return;
+				currentText = "";
+				partial.content.push({ type: "text", text: currentText });
+				currentTextIndex = partial.content.length - 1;
+				stream.push({ type: "text_start", contentIndex: currentTextIndex, partial });
+			};
+			const endText = () => {
+				if (currentTextIndex === null) return;
+				stream.push({
+					type: "text_end",
+					contentIndex: currentTextIndex,
+					content: currentText,
+					partial,
+				});
+				currentTextIndex = null;
+				currentText = "";
+			};
+			try {
+				while (true) {
+					const { done, value } = await reader.read();
+					if (done) break;
+					buffer += decoder.decode(value, { stream: true });
+					const lines = buffer.split("\n");
+					buffer = lines.pop() ?? "";
+					for (const line of lines) {
+						if (!line.startsWith("data: ")) continue;
+						const raw = line.slice(6).trim();
+						if (!raw || raw === "[DONE]") continue;
+						let parsed: any;
+						try {
+							parsed = JSON.parse(raw);
+						} catch {
+							continue;
+						}
+						const event = parsed.response ?? parsed;
+						const usage = event.usageMetadata;
+						if (typeof usage?.promptTokenCount === "number") partial.usage.input = usage.promptTokenCount;
+						if (typeof usage?.candidatesTokenCount === "number") partial.usage.output = usage.candidatesTokenCount;
+						partial.usage.totalTokens = partial.usage.input + partial.usage.output;
+						for (const part of event.candidates?.[0]?.content?.parts ?? []) {
+							if (typeof part.text === "string" && !part.thought) {
+								startText();
+								currentText += part.text;
+								const block = partial.content[currentTextIndex!] as { type: "text"; text: string };
+								block.text = currentText;
+								stream.push({ type: "text_delta", contentIndex: currentTextIndex!, delta: part.text, partial });
+							}
+							if (part.functionCall) {
+								endText();
+								const toolCall: ToolCall = {
+									type: "toolCall",
+									id: part.functionCall.id || `${part.functionCall.name}_${Date.now()}_${++toolCallCounter}`,
+									name: part.functionCall.name || "",
+									arguments: part.functionCall.args ?? {},
+								};
+								partial.content.push(toolCall);
+								const contentIndex = partial.content.length - 1;
+								stream.push({ type: "toolcall_start", contentIndex, partial });
+								stream.push({
+									type: "toolcall_delta",
+									contentIndex,
+									delta: JSON.stringify(toolCall.arguments),
+									partial,
+								});
+								stream.push({ type: "toolcall_end", contentIndex, toolCall, partial });
+							}
+						}
+					}
+				}
+			} finally {
+				reader.releaseLock();
+			}
+
+			endText();
+			partial.timestamp = Date.now();
+			if (partial.content.some((part) => part.type === "toolCall")) partial.stopReason = "toolUse";
+			stream.push({ type: "done", reason: partial.stopReason === "toolUse" ? "toolUse" : "stop", message: partial });
+			stream.end();
+		} catch (error) {
+			pushAntigravityError(stream, model, error, options?.signal?.aborted);
+		}
+	})();
+
+	return stream;
+}
+
 const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 	anthropic: {
 		displayName: "Anthropic (Claude Pro/Max)",
@@ -531,6 +802,7 @@ const ANTIGRAVITY_CLIENT_SECRET = [
 ].join("");
 const ANTIGRAVITY_LOAD_ASSIST_URL = "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist";
 const ANTIGRAVITY_ONBOARD_URL = "https://cloudcode-pa.googleapis.com/v1internal:onboardUser";
+const ANTIGRAVITY_GENERATE_BASE_URL = "https://daily-cloudcode-pa.googleapis.com";
 const GOOGLE_GEMINI_QUOTA_ENDPOINT = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota";
 const GOOGLE_ANTIGRAVITY_QUOTA_ENDPOINTS = [
 	"https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
@@ -2226,6 +2498,7 @@ function registerSub(pi: ExtensionAPI, entry: SubEntry): void {
 	pi.registerProvider(name, {
 		baseUrl,
 		api,
+		streamSimple: entry.provider === "google-antigravity" ? streamAntigravityDirect : undefined,
 		oauth: modifyModels ? { ...oauth, modifyModels } : oauth,
 		models,
 	});
