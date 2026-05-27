@@ -522,6 +522,19 @@ function sanitizeAntigravitySchema(schema: unknown): unknown {
 	return result;
 }
 
+function normalizeAntigravityModelId(modelId: string): string {
+	return modelId.replace(/^ag\//, "");
+}
+
+function assertKnownAntigravityModel(modelId: string): void {
+	const normalized = normalizeAntigravityModelId(modelId);
+	if ((ANTIGRAVITY_FALLBACK_MODELS as readonly string[]).includes(normalized)) return;
+	throw new Error(
+		`Antigravity model "${normalized}" is not in the known model list. `
+		+ `Run /subs switch and select one of: ${ANTIGRAVITY_FALLBACK_MODELS.join(", ")}`,
+	);
+}
+
 async function callAntigravityDirect(
 	accessToken: string,
 	model: Model<Api>,
@@ -541,9 +554,10 @@ async function callAntigravityDirect(
 		request.toolConfig = { functionCallingConfig: { mode: "VALIDATED" } };
 	}
 
+	assertKnownAntigravityModel(model.id);
 	const body = {
 		project: projectId || `end-pi-${randomUUID().slice(0, 8)}`,
-		model: model.id.replace(/^ag\//, ""),
+		model: normalizeAntigravityModelId(model.id),
 		userAgent: "antigravity",
 		requestType: "agent",
 		requestId: `agent-${randomUUID()}`,
