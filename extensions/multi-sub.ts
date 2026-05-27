@@ -88,6 +88,10 @@ import {
 	type SelectItem,
 } from "@mariozechner/pi-tui";
 
+const PACKAGE_NAME = "end-pi-multi-pass";
+const PACKAGE_VERSION = "0.0.7";
+const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
+
 // ==========================================================================
 // Provider templates
 // ==========================================================================
@@ -2233,8 +2237,78 @@ function globalConfigPath(): string {
 	return join(getAgentDir(), "multi-pass.json");
 }
 
+function updateCheckCachePath(): string {
+	return join(getAgentDir(), "multi-pass-update-check.json");
+}
+
 function projectConfigPath(cwd: string): string {
 	return join(cwd, ".pi", "multi-pass.json");
+}
+
+function compareVersions(left: string, right: string): number {
+	const leftParts = left.split(/[.-]/).map((part) => Number.parseInt(part, 10) || 0);
+	const rightParts = right.split(/[.-]/).map((part) => Number.parseInt(part, 10) || 0);
+	const length = Math.max(leftParts.length, rightParts.length);
+	for (let i = 0; i < length; i++) {
+		const diff = (leftParts[i] ?? 0) - (rightParts[i] ?? 0);
+		if (diff !== 0) return diff;
+	}
+	return 0;
+}
+
+function shouldCheckForPackageUpdate(now = Date.now()): boolean {
+	if (process.env.PI_OFFLINE) return false;
+	const path = updateCheckCachePath();
+	if (!existsSync(path)) return true;
+	try {
+		const raw = JSON.parse(readFileSync(path, "utf-8")) as { lastCheck?: unknown };
+		return typeof raw.lastCheck !== "number" || now - raw.lastCheck > UPDATE_CHECK_INTERVAL_MS;
+	} catch {
+		return true;
+	}
+}
+
+function writePackageUpdateCheckCache(latestVersion?: string): void {
+	try {
+		writeFileSync(updateCheckCachePath(), JSON.stringify({
+			lastCheck: Date.now(),
+			currentVersion: PACKAGE_VERSION,
+			latestVersion,
+		}, null, 2));
+	} catch {
+		// Best-effort cache only.
+	}
+}
+
+async function fetchLatestPackageVersion(signal?: AbortSignal): Promise<string | undefined> {
+	const response = await fetch(`https://registry.npmjs.org/${encodeURIComponent(PACKAGE_NAME)}/latest`, {
+		method: "GET",
+		headers: { "Accept": "application/json", "User-Agent": "end-pi-multi-pass" },
+		signal,
+	});
+	if (!response.ok) return undefined;
+	const data = await response.json() as { version?: unknown };
+	return typeof data.version === "string" ? data.version : undefined;
+}
+
+async function notifyIfPackageUpdateAvailable(ctx: ExtensionContext | ExtensionCommandContext): Promise<void> {
+	if (!shouldCheckForPackageUpdate()) return;
+	const controller = new AbortController();
+	const timeout = setTimeout(() => controller.abort(), 2500);
+	let latestVersion: string | undefined;
+	try {
+		latestVersion = await fetchLatestPackageVersion(controller.signal);
+	} catch {
+		return;
+	} finally {
+		clearTimeout(timeout);
+		writePackageUpdateCheckCache(latestVersion);
+	}
+	if (!latestVersion || compareVersions(latestVersion, PACKAGE_VERSION) <= 0) return;
+	ctx.ui.notify(
+		`multi-pass ${latestVersion} is available (current ${PACKAGE_VERSION}). Run: pi update npm:${PACKAGE_NAME}`,
+		"info",
+	);
 }
 
 function emptyMultiPassConfig(): MultiPassConfig {
@@ -6154,6 +6228,7 @@ export default function multiSub(pi: ExtensionAPI) {
 			ctx.ui.setStatus("multi-pass", statusParts.join(" | "));
 		}
 
+		void notifyIfPackageUpdateAvailable(ctx);
 		await enforceProjectRestriction(ctx, "session");
 	});
 
