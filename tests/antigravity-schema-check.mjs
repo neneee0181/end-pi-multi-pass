@@ -7,5 +7,7 @@ assert.match(source, /function sanitizeAntigravitySchema\(schema: unknown\): unk
 assert.match(source, /parameters: sanitizeAntigravitySchema\(tool\.parameters\)/);
 assert.match(source, /key === "patternProperties"/);
 assert.match(source, /key === "additionalProperties"/);
+assert.doesNotMatch(source, /"gemini-3\.5-flash",/);
+assert.match(source, /"gemini-3\.5-flash-low"/);
 
 console.log("antigravity schema checks passed");

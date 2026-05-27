@@ -865,10 +865,14 @@ const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 
 const SUPPORTED_PROVIDERS = Object.keys(PROVIDER_TEMPLATES);
 const ANTIGRAVITY_FALLBACK_MODELS = [
-	"gemini-3.5-flash",
+	"gemini-3.5-flash-low",
+	"gemini-3.5-flash-extra-low",
 	"gemini-3.1-pro-high",
 	"gemini-3.1-pro-low",
 	"gemini-3-flash",
+	"gemini-3-flash-agent",
+	"gemini-2.5-flash",
+	"gemini-2.5-pro",
 	"claude-sonnet-4-6",
 	"claude-opus-4-6-thinking",
 	"gpt-oss-120b-medium",
