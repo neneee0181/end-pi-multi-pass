@@ -486,9 +486,36 @@ function toolsToAntigravityDeclarations(context: Context): unknown[] {
 		functionDeclarations: [{
 			name: tool.name,
 			description: tool.description,
-			parameters: tool.parameters,
+			parameters: sanitizeAntigravitySchema(tool.parameters),
 		}],
 	}));
+}
+
+function sanitizeAntigravitySchema(schema: unknown): unknown {
+	if (Array.isArray(schema)) return schema.map(sanitizeAntigravitySchema);
+	if (!schema || typeof schema !== "object") return schema;
+
+	const source = schema as Record<string, unknown>;
+	const result: Record<string, unknown> = {};
+	for (const [key, value] of Object.entries(source)) {
+		if (
+			key === "$schema"
+			|| key === "$id"
+			|| key === "$defs"
+			|| key === "definitions"
+			|| key === "patternProperties"
+			|| key === "additionalProperties"
+			|| key === "unevaluatedProperties"
+			|| key === "propertyNames"
+			|| key === "dependencies"
+			|| key === "dependentSchemas"
+			|| key === "dependentRequired"
+		) {
+			continue;
+		}
+		result[key] = sanitizeAntigravitySchema(value);
+	}
+	return result;
 }
 
 async function callAntigravityDirect(
