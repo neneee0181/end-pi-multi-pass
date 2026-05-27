@@ -89,7 +89,7 @@ import {
 } from "@mariozechner/pi-tui";
 
 const PACKAGE_NAME = "end-pi-multi-pass";
-const PACKAGE_VERSION = "0.0.7";
+const PACKAGE_VERSION = "0.0.8";
 const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
 // ==========================================================================
